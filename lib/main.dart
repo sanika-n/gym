@@ -12,7 +12,6 @@ void main() async {
   await Supabase.initialize(
     url: 'https://rhavhpvmgeirzkpfaigw.supabase.co',
     anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJoYXZocHZtZ2VpcnprcGZhaWd3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzcyNTkxMDQsImV4cCI6MjA1MjgzNTEwNH0.75WgRMov_Xu_E5uL3Q0yhFxlIIsscTyD7JJ6q2q54Yg',
-  
   );
 
   // Initialize Foreground Task plugin
@@ -57,8 +56,11 @@ class LocationTracker extends StatefulWidget {
 class _LocationTrackerState extends State<LocationTracker> {
   Position? _currentPosition;
   StreamSubscription<Position>? _positionStreamSubscription;
+  Timer? _timeCheckTimer;
   int _counter = 0;
   bool _flag = false;
+  bool _isTrackingAllowed = false;
+  final List<Timer> _locationTimers = [];
 
   final List<List<double>> polygon = [
     [12.99025580072816, 80.23199075195609],
@@ -70,9 +72,57 @@ class _LocationTrackerState extends State<LocationTracker> {
   @override
   void initState() {
     super.initState();
+    _checkTrackingTime(); // Check initially
+    // Set up a timer to check every minute
+    _timeCheckTimer = Timer.periodic(const Duration(minutes: 1), (_) => _checkTrackingTime());
     _requestPermissionAndStartTracking();
     _fetchCounter();
     _subscribeToCounter();
+  }
+
+  bool _isWithinTrackingHours() {
+    final now = DateTime.now();
+    // Convert to IST (UTC+5:30)
+    final ist = now.toUtc().add(const Duration(hours: 5, minutes: 30));
+    
+    // Check if it's Sunday (where Sunday is 7 in DateTime.weekday)
+    if (ist.weekday == DateTime.sunday) {
+      return false;
+    }
+
+    // Create DateTime objects for 8:00 AM and 9:45 PM
+    final startTime = DateTime(ist.year, ist.month, ist.day, 8, 0);
+    final endTime = DateTime(ist.year, ist.month, ist.day, 21, 45);
+
+    return ist.isAfter(startTime) && ist.isBefore(endTime);
+  }
+
+  void _checkTrackingTime() {
+    bool shouldTrack = _isWithinTrackingHours();
+    
+    if (shouldTrack != _isTrackingAllowed) {
+      _isTrackingAllowed = shouldTrack;
+      if (_isTrackingAllowed) {
+        _startTracking();
+        _startForegroundTask();
+      } else {
+        _stopTracking();
+      }
+    }
+  }
+
+  void _stopTracking() {
+    _positionStreamSubscription?.cancel();
+    _positionStreamSubscription = null;
+    // Cancel all active location timers
+    for (var timer in _locationTimers) {
+      timer.cancel();
+    }
+    _locationTimers.clear();
+    FlutterForegroundTask.stopService();
+    setState(() {
+      _currentPosition = null;
+    });
   }
 
   Future<void> _fetchCounter() async {
@@ -115,19 +165,44 @@ class _LocationTrackerState extends State<LocationTracker> {
     var batteryPermission = await Permission.ignoreBatteryOptimizations.request();
 
     if (locationPermission.isGranted && backgroundLocationPermission.isGranted) {
-      _startForegroundTask();
-      _startTracking();
+      _checkTrackingTime(); // This will start tracking only if within allowed hours
     } else {
       print("Permissions not granted");
-      // Optionally, show a dialog to the user about missing permissions
     }
   }
 
   void _startTracking() {
-    _positionStreamSubscription = Geolocator.getPositionStream(
-      locationSettings: LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 1),
-    ).listen((Position position) {
-      print("📍 Got position: ${position.latitude}, ${position.longitude}");
+    if (!_isWithinTrackingHours()) {
+      return;
+    }
+
+    _positionStreamSubscription?.cancel(); // Cancel any existing subscription
+    
+    // Create a timer that gets location every 5 minutes
+    final locationTimer = Timer.periodic(const Duration(minutes: 5), (_) {
+      if (_isWithinTrackingHours()) {
+        Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.high,
+        ).then((Position position) {
+          print("📍 Got position: ${position.latitude}, ${position.longitude}");
+          setState(() {
+            _currentPosition = position;
+          });
+          _checkIfInsidePolygon(position);
+        });
+      } else {
+        _stopTracking();
+      }
+    });
+
+    // Store the timer for cleanup
+    _locationTimers.add(locationTimer);
+
+    // Get initial position immediately
+    Geolocator.getCurrentPosition(
+      desiredAccuracy: LocationAccuracy.high,
+    ).then((Position position) {
+      print("📍 Initial position: ${position.latitude}, ${position.longitude}");
       setState(() {
         _currentPosition = position;
       });
@@ -172,30 +247,40 @@ class _LocationTrackerState extends State<LocationTracker> {
     FlutterForegroundTask.startService(
       notificationTitle: 'Gym Tracker Running',
       notificationText: 'Tracking your location in background',
-      
     );
   }
 
   @override
   void dispose() {
-    FlutterForegroundTask.stopService();
-    _positionStreamSubscription?.cancel();  // Cancel location stream
+    _timeCheckTimer?.cancel();
+    // Cancel all active location timers
+    for (var timer in _locationTimers) {
+      timer.cancel();
+    }
+    _locationTimers.clear();
+    _stopTracking();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text("Gym Occupancy Tracker")),
+      appBar: AppBar(title: const Text("Gym Occupancy Tracker")),
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Text("People in Gym: $_counter", style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-            SizedBox(height: 20),
+            Text("People in Gym: $_counter", 
+                style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 20),
+            if (!_isTrackingAllowed)
+              const Text("Tracking is only available from 8:00 AM to 9:45 PM IST\nExcept Sundays",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.red)),
+            const SizedBox(height: 10),
             _currentPosition != null
                 ? Text("Lat: ${_currentPosition!.latitude}, Lng: ${_currentPosition!.longitude}")
-                : Text("Tracking location..."),
+                : const Text("Tracking location..."),
           ],
         ),
       ),
